@@ -4,10 +4,12 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"strings"
 	"time"
 
 	"strconv"
@@ -16,13 +18,21 @@ import (
 )
 
 // tickerEndpoint is the default API endpoint to proxy
-const tickerEndpoint = "https://api.bitcoinaverage.com/ticker/global/all"
+const tickerEndpoint = "https://apiv2.bitcoinaverage.com/indices/global/ticker/all?crypto=BTC"
 
 // httpClient is a an http client with a read timeout set
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
 // kvs is a helper type for logging
 type kvs health.Kvs
+
+type exchangeRate struct {
+	Ask  float64 `json:"ask"`
+	Bid  float64 `json:"bid"`
+	Last float64 `json:"last"`
+}
+
+type exchangeRates map[string]exchangeRate
 
 // Proxy gets data from the API endpoint and caches it
 type Proxy struct {
@@ -83,7 +93,8 @@ func (p *Proxy) Fetch() error {
 		job.Complete(health.Error)
 		return err
 	}
-	req.Header.Set("X-Signature", p.currentSignature())
+	req.Header.Set("X-signature", p.currentSignature())
+	fmt.Println(req.Header)
 
 	// Send the request
 	resp, err := httpClient.Get(p.url)
@@ -102,23 +113,32 @@ func (p *Proxy) Fetch() error {
 		return err
 	}
 
-	// Update cache on success, or notify upon failure
-	if resp.StatusCode == 200 {
-		p.lastResponseBody = body
-		p.lastResponseHeaders = resp.Header
-
-		// Cache to disk
-		if p.outfile != "" {
-			err := ioutil.WriteFile(p.outfile, body, 0644)
-			if err != nil {
-				job.EventErr("request.write_to_outfile", err)
-				job.Complete(health.Error)
-				return err
-			}
-			job.EventKv("request.write_to_outfile", kvs{"file": p.outfile})
-		}
-	} else {
+	if resp.StatusCode != 200 {
 		job.EventErr("request.status", errors.New(string(body)))
+		job.Complete(health.Error)
+		return err
+	}
+
+	// Save headers and formatted response
+	p.lastResponseHeaders = resp.Header
+	p.lastResponseBody, err = formatResponse(body)
+	if err != nil {
+		job.EventErr("request.format_response", err)
+		job.Complete(health.Error)
+		return err
+	}
+
+	fmt.Println(string(p.lastResponseBody))
+
+	// Cache to disk
+	if p.outfile != "" {
+		err := ioutil.WriteFile(p.outfile, p.lastResponseBody, 0644)
+		if err != nil {
+			job.EventErr("request.write_to_outfile", err)
+			job.Complete(health.Error)
+			return err
+		}
+		job.EventKv("request.write_to_outfile", kvs{"file": p.outfile})
 	}
 
 	job.Complete(health.Success)
@@ -190,4 +210,24 @@ func (p *Proxy) currentSignature() string {
 
 	// Return the final payload
 	return fmt.Sprintf("%s.%s", payload, signature)
+}
+
+func formatResponse(body []byte) ([]byte, error) {
+	incoming := make(exchangeRates)
+	err := json.Unmarshal(body, &incoming)
+	if err != nil {
+		return nil, err
+	}
+
+	outgoing := make(exchangeRates, len(incoming))
+	for k, v := range incoming {
+		outgoing[strings.TrimPrefix(k, "BTC")] = v
+	}
+
+	outgoingBytes, err := json.Marshal(outgoing)
+	if err != nil {
+		return nil, err
+	}
+
+	return outgoingBytes, nil
 }
